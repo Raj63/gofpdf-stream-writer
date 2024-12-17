@@ -1,4 +1,4 @@
-module github.com/jung-kurt/gofpdf
+module github.com/raj63/gofpdf-stream-writer
 
 go 1.17
 

@@ -248,6 +248,12 @@ func (f *Fpdf) Ok() bool {
 	return f.err == nil
 }
 
+func (f *Fpdf) WithPageSize(pageSize int) {
+	pageSize = pageSize + 1
+	f.pagesObjectNumbers = make([]int, pageSize)
+	f.pageSize = pageSize
+}
+
 // Err returns true if a processing error has occurred.
 func (f *Fpdf) Err() bool {
 	return f.err != nil
@@ -690,6 +696,42 @@ func (f *Fpdf) Close() {
 	f.endpage()
 	// Close document
 	f.enddoc()
+	return
+}
+
+func (f *Fpdf) streamOutput() {
+	if f.err == nil {
+		if f.clipNest > 0 {
+			f.err = fmt.Errorf("clip procedure must be explicitly ended")
+		} else if f.transformNest > 0 {
+			f.err = fmt.Errorf("transformation procedure must be explicitly ended")
+		}
+	}
+	if f.err != nil {
+		return
+	}
+	if f.state == 3 {
+		return
+	}
+	if f.page == 0 {
+		f.AddPage()
+		if f.err != nil {
+			return
+		}
+	}
+	// Page footer
+	f.inFooter = true
+	if f.footerFnc != nil {
+		f.footerFnc()
+	} else if f.footerFncLpi != nil {
+		f.footerFncLpi(true)
+	}
+	f.inFooter = false
+
+	// Close page
+	f.endpage()
+	// Close document
+	f.streamEnddoc()
 	return
 }
 
@@ -2925,7 +2967,7 @@ func (f *Fpdf) WriteLinkID(h float64, displayStr string, linkID int) {
 //
 // width indicates the width of the box the text will be drawn in. This is in
 // the unit of measure specified in New(). If it is set to 0, the bounding box
-//of the page will be taken (pageWidth - leftMargin - rightMargin).
+// of the page will be taken (pageWidth - leftMargin - rightMargin).
 //
 // lineHeight indicates the line height in the unit of measure specified in
 // New().
@@ -3475,6 +3517,40 @@ func (f *Fpdf) Output(w io.Writer) error {
 	return f.err
 }
 
+func (f *Fpdf) StreamClose(w io.Writer) error {
+	if f.err != nil {
+		return f.err
+	}
+	// dbg("Output")
+	if f.state < 3 {
+		f.streamCloseEnddoc()
+	}
+	size, err := f.buffer.WriteTo(w)
+	if err != nil {
+		f.err = err
+	}
+	fmt.Println("post refresh output", size)
+	f.totalLen = f.totalLen + size
+	return f.err
+}
+
+func (f *Fpdf) StreamOutput(w io.Writer) error {
+	if f.err != nil {
+		return f.err
+	}
+	// dbg("Output")
+	if f.state < 3 {
+		f.streamOutput()
+	}
+	size, err := f.buffer.WriteTo(w)
+	if err != nil {
+		f.err = err
+	}
+	fmt.Println("refresh output", size)
+	f.totalLen = f.totalLen + size
+	return f.err
+}
+
 func (f *Fpdf) getpagesizestr(sizeStr string) (size SizeType) {
 	if f.err != nil {
 		return
@@ -3738,7 +3814,7 @@ func (f *Fpdf) newobj() {
 	for j := len(f.offsets); j <= f.n; j++ {
 		f.offsets = append(f.offsets, 0)
 	}
-	f.offsets[f.n] = f.buffer.Len()
+	f.offsets[f.n] = (f.buffer.Len())
 	f.outf("%d 0 obj", f.n)
 }
 
@@ -3874,6 +3950,25 @@ func (f *Fpdf) replaceAliases() {
 	}
 }
 
+func (f *Fpdf) replaceAliase(index int) {
+	for mode := 0; mode < 2; mode++ {
+		for alias, replacement := range f.aliasMap {
+			if mode == 1 {
+				alias = utf8toutf16(alias, false)
+				replacement = utf8toutf16(replacement, false)
+			}
+			if index <= f.page {
+				s := f.pages[index].String()
+				if strings.Contains(s, alias) {
+					s = strings.Replace(s, alias, replacement, -1)
+					f.pages[index].Truncate(0)
+					f.pages[index].WriteString(s)
+				}
+			}
+		}
+	}
+}
+
 func (f *Fpdf) putpages() {
 	var wPt, hPt float64
 	var pageSize SizeType
@@ -3958,6 +4053,121 @@ func (f *Fpdf) putpages() {
 	kids.printf("/Kids [")
 	for i := 1; i <= nb; i++ {
 		kids.printf("%d 0 R ", pagesObjectNumbers[i])
+	}
+	kids.printf("]")
+	f.out(kids.String())
+	f.outf("/Count %d", nb)
+	f.outf("/MediaBox [0 0 %.2f %.2f]", wPt, hPt)
+	f.out(">>")
+	f.out("endobj")
+}
+
+func (f *Fpdf) streamPutpages() {
+	var hPt float64
+	var pageSize SizeType
+	var ok bool
+	nb := f.page
+	if len(f.aliasNbPagesStr) > 0 {
+		// Replace number of pages
+		f.RegisterAlias(f.aliasNbPagesStr, sprintf("%d", f.pageSize))
+	}
+	f.replaceAliase(nb)
+
+	if f.defOrientation == "P" {
+		hPt = f.defPageSize.Ht * f.k
+	} else {
+		hPt = f.defPageSize.Wd * f.k
+	}
+	{
+		n := nb
+		// Page
+		f.newobj()
+		f.pagesObjectNumbers[n] = f.n // save for /Kids
+		f.out("<</Type /Page")
+		f.out("/Parent 1 0 R")
+		pageSize, ok = f.pageSizes[n]
+		if ok {
+			f.outf("/MediaBox [0 0 %.2f %.2f]", pageSize.Wd, pageSize.Ht)
+		}
+		for t, pb := range f.pageBoxes[n] {
+			f.outf("/%s [%.2f %.2f %.2f %.2f]", t, pb.X, pb.Y, pb.Wd, pb.Ht)
+		}
+		f.out("/Resources 2 0 R")
+		// Links
+		if len(f.pageLinks[n])+len(f.pageAttachments[n]) > 0 {
+			var annots fmtBuffer
+			annots.printf("/Annots [")
+			for _, pl := range f.pageLinks[n] {
+				annots.printf("<</Type /Annot /Subtype /Link /Rect [%.2f %.2f %.2f %.2f] /Border [0 0 0] ",
+					pl.x, pl.y, pl.x+pl.wd, pl.y-pl.ht)
+				if pl.link == 0 {
+					annots.printf("/A <</S /URI /URI %s>>>>", f.textstring(pl.linkStr))
+				} else {
+					l := f.links[pl.link]
+					var sz SizeType
+					var h float64
+					sz, ok = f.pageSizes[l.page]
+					if ok {
+						h = sz.Ht
+					} else {
+						h = hPt
+					}
+					// dbg("h [%.2f], l.y [%.2f] f.k [%.2f]\n", h, l.y, f.k)
+					annots.printf("/Dest [%d 0 R /XYZ 0 %.2f null]>>", 1+2*l.page, h-l.y*f.k)
+				}
+			}
+			f.putAttachmentAnnotationLinks(&annots, n)
+			annots.printf("]")
+			f.out(annots.String())
+		}
+		if f.pdfVersion > "1.3" {
+			f.out("/Group <</Type /Group /S /Transparency /CS /DeviceRGB>>")
+		}
+		f.outf("/Contents %d 0 R>>", f.n+1)
+		f.out("endobj")
+		// Page content
+		f.newobj()
+		if f.compress {
+			data := sliceCompress(f.pages[n].Bytes())
+			f.outf("<</Filter /FlateDecode /Length %d>>", len(data))
+			f.putstream(data)
+		} else {
+			f.outf("<</Length %d>>", f.pages[n].Len())
+			f.putstream(f.pages[n].Bytes())
+		}
+		f.out("endobj")
+
+		clearPage(f.pages, n)
+	}
+
+}
+
+func clearPage(pages []*bytes.Buffer, index int) {
+	if index >= 0 && index < len(pages) {
+		pages[index] = bytes.NewBuffer(nil) // Replace with an empty buffer
+	}
+}
+
+func (f *Fpdf) streamClosePutpages() {
+	var wPt, hPt float64
+	nb := f.page
+
+	if f.defOrientation == "P" {
+		wPt = f.defPageSize.Wd * f.k
+		hPt = f.defPageSize.Ht * f.k
+	} else {
+		wPt = f.defPageSize.Ht * f.k
+		hPt = f.defPageSize.Wd * f.k
+	}
+
+	// Pages root
+	f.offsets[1] = f.buffer.Len()
+	f.out("1 0 obj")
+	f.out("<</Type /Pages")
+	var kids fmtBuffer
+	kids.printf("/Kids [")
+	for i := 1; i <= nb; i++ {
+		kids.printf("%d 0 R ", f.pagesObjectNumbers[i])
 	}
 	kids.printf("]")
 	f.out(kids.String())
@@ -4344,7 +4554,10 @@ func (f *Fpdf) putimages() {
 	var keyList []string
 	var key string
 	for key = range f.images {
-		keyList = append(keyList, key)
+		if f.images[key].data != nil {
+			keyList = append(keyList, key)
+		}
+
 	}
 
 	// Sort the keyList []string by the corresponding image's width.
@@ -4357,6 +4570,9 @@ func (f *Fpdf) putimages() {
 	insertedImages := map[string]int{}
 
 	for _, key = range keyList {
+		if f.images[key].data == nil {
+			continue
+		}
 		image := f.images[key]
 
 		// Check if this image has already been inserted using it's SHA-1 hash.
@@ -4371,6 +4587,7 @@ func (f *Fpdf) putimages() {
 			f.putimage(image)
 			insertedImages[image.i] = image.n
 		}
+		image.data = nil
 	}
 }
 
@@ -4823,6 +5040,75 @@ func (f *Fpdf) enddoc() {
 	f.out("%%EOF")
 	f.state = 3
 	return
+}
+
+func (f *Fpdf) headerWrite() {
+	if f.totalLen == 0 {
+		f.layerEndDoc()
+		f.putheader()
+	}
+}
+
+func (f *Fpdf) streamCloseEnddoc() {
+	if f.err != nil {
+		return
+	}
+	// Embedded files
+	f.putAttachments()
+	f.putAnnotationsAttachments()
+
+	f.streamClosePutpages()
+
+	f.putresources()
+	if f.err != nil {
+		return
+	}
+	// Bookmarks
+	f.putbookmarks()
+	// Metadata
+	f.putxmp()
+	// 	Info
+	f.newobj()
+	f.out("<<")
+	f.putinfo()
+	f.out(">>")
+	f.out("endobj")
+	// 	Catalog
+	f.newobj()
+	f.out("<<")
+	f.putcatalog()
+	f.out(">>")
+	f.out("endobj")
+	// Cross-ref
+	o := f.buffer.Len()
+	f.out("xref")
+	f.outf("0 %d", f.n+1)
+	f.out("0000000000 65535 f ")
+	for j := 1; j <= f.n; j++ {
+		f.outf("%010d 00000 n ", f.offsets[j])
+	}
+	// Trailer
+	f.out("trailer")
+	f.out("<<")
+	f.puttrailer()
+	f.out(">>")
+	f.out("startxref")
+	f.outf("%d", o)
+	f.out("%%EOF")
+	f.state = 3
+}
+
+func (f *Fpdf) streamEnddoc() {
+	if f.err != nil {
+		return
+	}
+	f.headerWrite()
+	f.streamPutpages()
+
+	f.putimages()
+	if f.err != nil {
+		return
+	}
 }
 
 // Path Drawing

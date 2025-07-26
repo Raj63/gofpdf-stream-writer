@@ -1,6 +1,6 @@
 # Note
 This fork repo is created to address the issue mentioned here
-![](https://github.com/jung-kurt/gofpdf/issues/110#issuecomment-484241666)
+[Pdf memory issue](https://github.com/jung-kurt/gofpdf/issues/110#issuecomment-484241666)
 
 # GoFPDF document generator
 
